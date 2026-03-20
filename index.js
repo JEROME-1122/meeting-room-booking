@@ -11,6 +11,10 @@ app.get("/", (req, res) => {
   res.send("Welcome to the Meeting Room Booking API");
 });
 
+// routes
+app.use("/rooms", require("./routes/roomRoutes"));
+app.use("/bookings", require("./routes/bookingRoutes"));
+
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => {
