@@ -5,79 +5,99 @@ const Idempotency = require("../models/idempotencyModel");
 const mongoose = require("mongoose");
 
 exports.createBooking = async (data, idempotencyKey) => {
-  const { roomId, startTime, endTime, title, organizerEmail } = data;
+  try {
+    const { roomId, startTime, endTime, title, organizerEmail } = data;
 
-  if (!roomId || !startTime || !endTime || !organizerEmail)
-    throw { status: 400, message: "Missing required fields" };
+    if (!roomId || !startTime || !endTime || !organizerEmail)
+      throw { status: 400, message: "Missing required fields" };
 
-  const start = new Date(startTime);
-  const end = new Date(endTime);
+    const start = new Date(startTime);
+    const end = new Date(endTime);
 
-  if (start >= end)
-    throw { status: 400, message: "startTime must be before endTime" };
+    if (start >= end)
+      throw { status: 400, message: "startTime must be before endTime" };
 
-  const duration = (end - start) / (1000 * 60);
-  if (duration < 15 || duration > 240)
-    throw { status: 400, message: "Booking duration must be 15-240 minutes" };
+    const duration = (end - start) / (1000 * 60);
+    if (duration < 15 || duration > 240)
+      throw { status: 400, message: "Booking duration must be 15-240 minutes" };
 
-  const day = start.getDay();
-  const hour = start.getHours();
-  if (day === 0 || day === 6 || hour < 8 || hour >= 20)
-    throw {
-      status: 400,
-      message: "Booking outside working hours (Mon-Fri 8-20)",
-    };
+    const day = start.getDay();
+    const hour = start.getHours();
+    if (day === 0 || day === 6 || hour < 8 || hour >= 20)
+      throw {
+        status: 400,
+        message: "Booking outside working hours",
+      };
 
-  const room = await Room.findById(roomId);
-  if (!room) throw { status: 404, message: "Room not found" };
+    const room = await Room.findById(roomId);
+    if (!room) throw { status: 404, message: "Room not found" };
 
-  // Idempotency check
-  if (idempotencyKey) {
-    let idem = await Idempotency.findOne({
-      key: idempotencyKey,
-      organizerEmail,
-    });
-    if (idem) {
-      if (idem.status === "completed") return idem.response;
-      else throw { status: 409, message: "Request in progress" };
+    if (idempotencyKey) {
+      const idem = await Idempotency.findOne({
+        key: idempotencyKey,
+        organizerEmail,
+      });
+
+      if (idem) {
+        if (idem.status === "completed") return idem.response;
+        throw { status: 409, message: "Request in progress" };
+      }
+
+      await Idempotency.create({
+        key: idempotencyKey,
+        organizerEmail,
+        status: "in-progress",
+      });
     }
-    idem = await Idempotency.create({ key: idempotencyKey, organizerEmail });
+
+    const conflict = await Booking.findOne({
+      roomId,
+      status: "confirmed",
+      startTime: { $lt: end },
+      endTime: { $gt: start },
+    });
+
+    if (conflict) throw { status: 409, message: "Booking conflict" };
+
+    const booking = await Booking.create({
+      roomId,
+      startTime,
+      endTime,
+      title,
+      organizerEmail,
+      idempotencyKey,
+    });
+
+     
+    if (idempotencyKey) {
+      await Idempotency.findOneAndUpdate(
+        { key: idempotencyKey, organizerEmail },
+        { status: "completed", response: booking },
+      );
+    }
+
+    return booking;
+  } catch (err) {
+  
+    if (idempotencyKey) {
+      await Idempotency.deleteOne({
+        key: idempotencyKey,
+        organizerEmail: data.organizerEmail,
+      });
+    }
+
+    throw err;
   }
-
-  const conflict = await Booking.findOne({
-    roomId,
-    status: "confirmed",
-    startTime: { $lt: end },
-    endTime: { $gt: start },
-  });
-  if (conflict) throw { status: 409, message: "Booking conflict" };
-
-  const booking = await Booking.create({
-    roomId,
-    startTime,
-    endTime,
-    title,
-    organizerEmail,
-    idempotencyKey,
-  });
-
-  if (idempotencyKey) {
-    await Idempotency.findOneAndUpdate(
-      { key: idempotencyKey, organizerEmail },
-      { status: "completed", response: booking },
-    );
-  }
-
-  return booking;
 };
 
 exports.cancelBooking = async (id) => {
+   
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    throw { status: 400, message: "Invalid bookingId" };
+  }
+
   const booking = await Booking.findById(id);
   if (!booking) throw { status: 404, message: "Booking not found" };
-
-  if (!mongoose.Types.ObjectId.isValid(roomId)) {
-    throw { status: 400, message: "Invalid roomId" };
-  }
 
   if (booking.status === "cancelled") return booking;
 
@@ -126,29 +146,48 @@ exports.roomUtilizationReport = async (from, to) => {
     const roomBookings = bookings.filter(
       (b) => b.roomId.toString() === room._id.toString(),
     );
-    let totalBooked = 0;
+
+    let totalBookedHours = 0;
 
     roomBookings.forEach((b) => {
-      const overlapStart = b.startTime > start ? b.startTime : start;
-      const overlapEnd = b.endTime < end ? b.endTime : end;
-      totalBooked += (overlapEnd - overlapStart) / (1000 * 60 * 60); // hours
+      const overlapStart = new Date(Math.max(b.startTime, start));
+      const overlapEnd = new Date(Math.min(b.endTime, end));
+
+      if (overlapStart < overlapEnd) {
+        totalBookedHours += (overlapEnd - overlapStart) / (1000 * 60 * 60);
+      }
     });
 
-    // total business hours
     let totalBusinessHours = 0;
-    const cur = new Date(start);
-    while (cur <= end) {
-      const day = cur.getDay();
-      if (day >= 1 && day <= 5) totalBusinessHours += 12; // 8:00-20:00
-      cur.setDate(cur.getDate() + 1);
+    let current = new Date(start);
+
+    while (current < end) {
+      const day = current.getDay();
+
+      if (day >= 1 && day <= 5) {
+        const dayStart = new Date(current);
+        dayStart.setHours(8, 0, 0, 0);
+
+        const dayEnd = new Date(current);
+        dayEnd.setHours(20, 0, 0, 0);
+
+        const overlapStart = new Date(Math.max(dayStart, start));
+        const overlapEnd = new Date(Math.min(dayEnd, end));
+
+        if (overlapStart < overlapEnd) {
+          totalBusinessHours += (overlapEnd - overlapStart) / (1000 * 60 * 60);
+        }
+      }
+
+      current.setDate(current.getDate() + 1);
     }
 
     return {
       roomId: room._id,
       roomName: room.name,
-      totalBookingHours: totalBooked,
+      totalBookingHours: +totalBookedHours.toFixed(2),
       utilizationPercent: totalBusinessHours
-        ? +(totalBooked / totalBusinessHours).toFixed(2)
+        ? +((totalBookedHours / totalBusinessHours) * 100).toFixed(2)
         : 0,
     };
   });
