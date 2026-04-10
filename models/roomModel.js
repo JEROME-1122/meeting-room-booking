@@ -5,15 +5,15 @@ const roomSchema = new mongoose.Schema(
     name: {
       type: String,
       required: true,
-      lowercase: true,
       unique: true,
     },
     capacity: {
       type: Number,
       required: true,
-      min: 1,
     },
-    floor: Number,
+    floor: {
+      type: Number,
+    },
     amenities: [String],
   },
   { timestamps: true },
